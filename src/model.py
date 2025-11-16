@@ -3,9 +3,23 @@ import chess
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from datasets import load_dataset
+dset = load_dataset("Lichess/chess-evaluations", split="train")
 
 C_PLANES = 12
 NUM_MOVES = 64 * 64
+
+# HuggingFace calls a row an "example"
+def preprocess(example):
+    board = chess.Board(example["fen"])
+    example["input"] = board_to_tensor(board)
+    return example
+
+# turns individual tensors into a tensor batch
+def collate_fn(batch):
+    return torch.stack(b["input"] for b in batch)
 
 def board_to_tensor(board: chess.Board):   
     tensor = np.zeros((C_PLANES, 8, 8), dtype=np.float32)
@@ -78,4 +92,14 @@ class SimpleChessNet(nn.Module):
 
         return policy, value
 
-# total_loss = cross_entropy(policy, labels_policy) + MSE(value, labels_value)
+
+def main():
+    # collect data
+    filtered = dset.filter(lambda row: row["white_elo"] >= 1000 and row["black_elo"] >= 1000)
+    small_subset = filtered.select(range(100_000))
+    tensor_dataset = small_subset.map(preprocess, remove_columns=small_subset.column_names)
+
+    # total_loss = cross_entropy(policy, labels_policy) + MSE(value, labels_value)
+
+if __name__ == "__main__":
+    main()
