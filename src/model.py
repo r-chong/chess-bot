@@ -18,7 +18,19 @@ def preprocess(example):
 
 # turns individual tensors into a tensor batch
 def collate_fn(batch):
-    return torch.stack(b["input"] for b in batch)
+    inputs = torch.stack(b["input"] for b in batch)
+
+    policy = torch.tensor(
+        [b["policy"] for b in batch],
+        dtype=torch.long
+    )
+
+    value = torch.tensor(
+        [b["value"] for b in batch],
+        dtype=torch.float32
+    ).unsqueeze(1)
+
+    return inputs, policy, value
 
 def board_to_tensor(board: chess.Board):   
     tensor = np.zeros((C_PLANES, 8, 8), dtype=np.float32)
