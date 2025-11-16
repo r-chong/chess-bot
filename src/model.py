@@ -34,6 +34,7 @@ def collate_fn(batch):
 
     return inputs, policy, value
 
+# for value we want to know who's winning
 def make_value_label(example):
     # white centipawns
     cp = example["cp"]
@@ -49,6 +50,7 @@ def make_value_label(example):
     example["value"] = np.float32(value)
     return example
 
+# extract best move from dataset since we want to know the best move
 def make_policy_label(example):
     # line is the best move sequence Stockfish found from that position, written in UCI move format.
     line = example["line"]
@@ -149,6 +151,8 @@ def main():
     small_subset = filtered.select(range(100_000))
 
     tensor_dataset = small_subset.map(preprocess)
+
+    # add new columns based on extracted info from these functions
     tensor_dataset = tensor_dataset.map(make_value_label)
     tensor_dataset = tensor_dataset.map(make_policy_label)
 
@@ -167,7 +171,7 @@ def main():
 
     model = SimpleChessNet().to(DEVICE)
 
-    policy_criterion = nn.CrossEntropyLoss()
+    policy_criterion = nn.CrossEntropyLoss(ignore_index=-1)
     value_criterion = nn.MSELoss()
     
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
