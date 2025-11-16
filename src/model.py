@@ -6,7 +6,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from datasets import load_dataset
-dset = load_dataset("Lichess/chess-evaluations", split="train")
 
 C_PLANES = 12
 NUM_MOVES = 64 * 64
@@ -68,7 +67,7 @@ class SimpleChessNet(nn.Module):
         # predict logits over move indices
         self.policy_head = nn.Sequential(
             # 4096 "possible" moves (not actually)
-            nn.Linear(64 * 8 * 8, NUM_MOVES),
+            nn.Linear(64 * 8 * 8, moves),
         )
 
         # predict scalar in range [-1, 1]
@@ -95,9 +94,32 @@ class SimpleChessNet(nn.Module):
 
 def main():
     # collect data
-    filtered = dset.filter(lambda row: row["white_elo"] >= 1000 and row["black_elo"] >= 1000)
+    dset = load_dataset("Lichess/chess-evaluations", split="train[:200000]")
+
+    # filter out low-depth / unusable samples
+    filtered = dset.filter(lambda row: row["depth"] >= 16 and row["cp"] is not None)
     small_subset = filtered.select(range(100_000))
-    tensor_dataset = small_subset.map(preprocess, remove_columns=small_subset.column_names)
+
+    tensor_dataset = small_subset.map(preprocess)
+    tensor_dataset = tensor_dataset.map(make_value_label)
+    tensor_dataset = tensor_dataset.map(make_policy_label)
+
+    # remove string columns so it's only numbers
+    tensor_dataset = tensor_dataset.remove_columns(["fen", "line"])
+
+    # turn into pytorch tensor format
+    tensor_dataset = tensor_dataset.with_format("torch")
+
+    loader = DataLoader(
+        tensor_dataset,
+        batch_size=128,
+        collate_fn=collate_fn,
+        shuffle=True
+    )
+
+    model = SimpleChessNet()
+
+    # TRAINING LOGIC
 
     # total_loss = cross_entropy(policy, labels_policy) + MSE(value, labels_value)
 
