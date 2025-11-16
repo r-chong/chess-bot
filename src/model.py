@@ -12,7 +12,9 @@ import modal
 # CONSTANTS
 C_PLANES = 12
 NUM_MOVES = 64 * 64
-NUM_EPOCHS = 15  # Increased from 5 for better convergence
+NUM_EPOCHS = 30  # More epochs with smaller, more efficient model
+BATCH_SIZE = 256  # Larger batch size for better gradient estimates
+LEARNING_RATE = 2e-3  # Higher initial LR with cosine annealing
 
 # HuggingFace calls a row an "example"
 def preprocess(example):
@@ -105,37 +107,65 @@ def board_to_tensor(board: chess.Board):
 class SimpleChessNet(nn.Module):
     def __init__(self, moves=NUM_MOVES):
         super().__init__()
-        self.cnn = nn.Sequential(
-            nn.Conv2d(C_PLANES, 32, kernel_size=3, padding=1),
+        
+        # More efficient architecture: deeper with fewer channels
+        # Input: (B, 12, 8, 8)
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(C_PLANES, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
             nn.ReLU(),
+        )
+        
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+        )
+        
+        self.conv3 = nn.Sequential(
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(),
         )
-
-        self.flat = nn.Flatten()
-
-        # predict logits over move indices
+        
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+        )
+        
+        # Global average pooling to reduce spatial dimensions
+        self.gap = nn.AdaptiveAvgPool2d(1)  # Output: (B, 64, 1, 1)
+        
+        # Smaller heads since we use GAP
         self.policy_head = nn.Sequential(
-            # 4096 "possible" moves (not actually)
-            nn.Linear(64 * 8 * 8, moves),
+            nn.Flatten(),
+            nn.Linear(64, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, moves),
         )
 
-        # predict scalar in range [-1, 1]
         self.value_head = nn.Sequential(
-            nn.Linear(64 * 8 * 8, 128),
+            nn.Flatten(),
+            nn.Linear(64, 64),
             nn.ReLU(),
-            nn.Linear(128, 1),
-
-            # activation; squash into [-1, 1]
+            nn.Dropout(0.3),
+            nn.Linear(64, 1),
             nn.Tanh()
         )
     
     def forward(self, x):
-        # x is our tensor
-        x = self.cnn(x)
-
-        x = self.flat(x)
-
+        # Conv layers with residual-like connections
+        x = self.conv1(x)  # (B, 16, 8, 8)
+        x = self.conv2(x)  # (B, 32, 8, 8)
+        x = self.conv3(x)  # (B, 64, 8, 8)
+        x = self.conv4(x)  # (B, 64, 8, 8)
+        
+        # Global pooling
+        x = self.gap(x)  # (B, 64, 1, 1)
+        
+        # Split into policy and value heads
         policy = self.policy_head(x)
         value = self.value_head(x)
 
@@ -160,42 +190,70 @@ def main(volume_path=None):
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {DEVICE}")
 
-    # collect data
-    dset = load_dataset("Lichess/chess-position-evaluations", split="train[:200000]")
-
-    # filter out low-depth / unusable samples
-    filtered = dset.filter(lambda row: row["depth"] >= 16 and row["cp"] is not None)
-    small_subset = filtered.select(range(100_000))
-
-    tensor_dataset = small_subset.map(preprocess)
+    # collect data with streaming to avoid downloading everything upfront
+    print("Loading dataset with streaming mode...")
+    dset = load_dataset(
+        "Lichess/chess-position-evaluations", 
+        split="train",  # Can't use slice notation with streaming
+        streaming=True,  # Enable streaming to avoid full download
+        cache_dir="/tmp/huggingface_cache" if volume_path else None  # Cache dataset files
+    )
+    
+    # Process streaming dataset
+    # filter out low-depth / unusable samples and take first 200k to filter from
+    print("Taking and filtering samples...")
+    limited = dset.take(200_000)
+    filtered = limited.filter(lambda row: row["depth"] >= 16 and row["cp"] is not None)
+    
+    # Take first 100k from filtered stream
+    print("Converting to list (this may take a moment)...")
+    filtered_list = list(filtered.take(100_000))
+    
+    # Convert back to Dataset for efficient processing
+    from datasets import Dataset
+    small_subset = Dataset.from_list(filtered_list)
+    
+    print("Processing dataset...")
+    tensor_dataset = small_subset.map(preprocess, num_proc=4)  # Parallel processing
 
     # add new columns based on extracted info from these functions
-    tensor_dataset = tensor_dataset.map(make_value_label)
-    tensor_dataset = tensor_dataset.map(make_policy_label)
+    tensor_dataset = tensor_dataset.map(make_value_label, num_proc=4)
+    tensor_dataset = tensor_dataset.map(make_policy_label, num_proc=4)
 
     # remove string columns so it's only numbers
     tensor_dataset = tensor_dataset.remove_columns(["fen", "line"])
 
     # turn into pytorch tensor format
     tensor_dataset = tensor_dataset.with_format("torch")
+    
+    print(f"Dataset ready with {len(tensor_dataset)} samples")
 
     loader = DataLoader(
         tensor_dataset,
-        batch_size=128,
+        batch_size=BATCH_SIZE,
         collate_fn=collate_fn,
-        shuffle=True
+        shuffle=True,
+        num_workers=0,  # No multiprocessing for Modal
+        pin_memory=True  # Faster GPU transfer
     )
 
     model = SimpleChessNet().to(DEVICE)
+    
+    # Print model info
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model parameters: {total_params:,} (trainable: {trainable_params:,})")
+    print(f"Estimated model size: {total_params * 4 / (1024**2):.2f} MB")
 
     policy_criterion = nn.CrossEntropyLoss(ignore_index=-1)
     value_criterion = nn.MSELoss()
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    # AdamW optimizer with weight decay for regularization
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     
-    # Learning rate scheduler for better convergence
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=2, verbose=True
+    # Cosine annealing scheduler for smooth LR decay
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=NUM_EPOCHS, eta_min=1e-5
     )
 
     # -------------
@@ -249,14 +307,16 @@ def main(volume_path=None):
         epoch_policy = running_policy_loss / n_examples
         epoch_value = running_value_loss / n_examples
 
+        current_lr = optimizer.param_groups[0]['lr']
         print(
                 f"Epoch {epoch+1}/{NUM_EPOCHS} "
                 f"- loss: {epoch_loss:.4f} "
-                f"(policy: {epoch_policy:.4f}, value: {epoch_value:.4f})"
+                f"(policy: {epoch_policy:.4f}, value: {epoch_value:.4f}) "
+                f"- lr: {current_lr:.6f}"
             )
         
-        # Update learning rate based on loss
-        scheduler.step(epoch_loss)
+        # Update learning rate with cosine schedule
+        scheduler.step()
         
         # Save checkpoint if loss improved
         if epoch_loss < best_loss:
@@ -271,8 +331,8 @@ def main(volume_path=None):
                 }, checkpoint_path)
                 print(f"✓ Saved best model checkpoint (loss: {epoch_loss:.4f})")
         
-        # Save periodic checkpoint every 5 epochs
-        if volume_path and (epoch + 1) % 5 == 0:
+        # Save periodic checkpoint every 10 epochs
+        if volume_path and (epoch + 1) % 10 == 0:
             checkpoint_path = f"{volume_path}/checkpoint_epoch_{epoch+1}.pt"
             torch.save({
                 'epoch': epoch,
