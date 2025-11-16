@@ -1,10 +1,14 @@
 import numpy as np
 import chess
 
+import torch
+import torch.nn as nn
+
 C_PLANES = 12
+NUM_MOVES = 64 * 64
 
 def board_to_tensor(board: chess.Board):   
-    tensor = np.zeros((8, 8, C_PLANES), dtype=np.float32)
+    tensor = np.zeros((C_PLANES, 8, 8), dtype=np.float32)
 
     # what each of the planes represent
     # we separated for all of the types of pieces, and differentiate between white and black by adding 6 later
@@ -14,7 +18,7 @@ def board_to_tensor(board: chess.Board):
         chess.BISHOP: 2,
         chess.ROOK: 3,
         chess.QUEEN: 4,
-        chess.KING, 5
+        chess.KING: 5
     }
 
     for square, piece in board.piece_map().items():
@@ -26,8 +30,52 @@ def board_to_tensor(board: chess.Board):
 
         idx = piece_to_index[piece.piece_type]
 
-        if piece.color = chess.BLACK:
+        if piece.color == chess.BLACK:
             idx += 6 # offset for black pieces
 
-        tensor[row, col, idx] = 1
+        tensor[idx, row, col] = 1
+    
+    # return as torch tensor (C, H, W)
+    return torch.from_numpy(tensor)
+    
+# nn.Module parent class is from PyTorch
+class SimpleChessNet(nn.Module):
+    def __init__(self, moves=NUM_MOVES):
+        super().__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv2d(C_PLANES, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
 
+        self.flat = nn.Flatten()
+
+        # predict logits over move indices
+        self.policy_head = nn.Sequential(
+            # 4096 "possible" moves (not actually)
+            nn.Linear(64 * 8 * 8, NUM_MOVES),
+        )
+
+        # predict scalar in range [-1, 1]
+        self.value_head = nn.Sequential(
+            nn.Linear(64 * 8 * 8, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1),
+
+            # activation; squash into [-1, 1]
+            nn.Tanh()
+        )
+    
+    def forward(self, x):
+        # x is our tensor
+        x = self.cnn(x)
+
+        x = self.flat(x)
+
+        policy = self.policy_head(x)
+        value = self.value_head(x)
+
+        return policy, value
+
+# total_loss = cross_entropy(policy, labels_policy) + MSE(value, labels_value)
