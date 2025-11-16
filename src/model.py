@@ -12,7 +12,7 @@ import modal
 # CONSTANTS
 C_PLANES = 12
 NUM_MOVES = 64 * 64
-NUM_EPOCHS = 5
+NUM_EPOCHS = 15  # Increased from 5 for better convergence
 
 # HuggingFace calls a row an "example"
 def preprocess(example):
@@ -142,8 +142,23 @@ class SimpleChessNet(nn.Module):
         return policy, value
 
 
-def main():
+def load_model(checkpoint_path, device=None):
+    """Load a saved model checkpoint"""
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    model = SimpleChessNet().to(device)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    
+    print(f"✓ Loaded model from epoch {checkpoint['epoch']} with loss {checkpoint['loss']:.4f}")
+    return model
+
+
+def main(volume_path=None):
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {DEVICE}")
 
     # collect data
     dset = load_dataset("Lichess/chess-position-evaluations", split="train[:200000]")
@@ -177,12 +192,19 @@ def main():
     value_criterion = nn.MSELoss()
     
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    
+    # Learning rate scheduler for better convergence
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=2, verbose=True
+    )
 
     # -------------
     # TRAINING LOOP
     # -------------
 
     # SEE TOP FOR EPOCH CONSTANT
+    
+    best_loss = float('inf')
 
     for epoch in range(NUM_EPOCHS):
         model.train()
@@ -211,7 +233,10 @@ def main():
             # backpropagation
             loss.backward()
 
-            # gradient descent??
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            # gradient descent
             optimizer.step()
 
             batch_size = inputs.size(0)
@@ -229,9 +254,52 @@ def main():
                 f"- loss: {epoch_loss:.4f} "
                 f"(policy: {epoch_policy:.4f}, value: {epoch_value:.4f})"
             )
+        
+        # Update learning rate based on loss
+        scheduler.step(epoch_loss)
+        
+        # Save checkpoint if loss improved
+        if epoch_loss < best_loss:
+            best_loss = epoch_loss
+            if volume_path:
+                checkpoint_path = f"{volume_path}/best_model.pt"
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': epoch_loss,
+                }, checkpoint_path)
+                print(f"✓ Saved best model checkpoint (loss: {epoch_loss:.4f})")
+        
+        # Save periodic checkpoint every 5 epochs
+        if volume_path and (epoch + 1) % 5 == 0:
+            checkpoint_path = f"{volume_path}/checkpoint_epoch_{epoch+1}.pt"
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': epoch_loss,
+            }, checkpoint_path)
+            print(f"✓ Saved checkpoint at epoch {epoch+1}")
+    
+    # Save final model
+    if volume_path:
+        final_path = f"{volume_path}/final_model.pt"
+        torch.save({
+            'epoch': NUM_EPOCHS - 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': epoch_loss,
+        }, final_path)
+        print(f"✓ Training complete! Final model saved to {final_path}")
+    
+    return model
 
 ##############################################
 app = modal.App("chess-eval-training")
+
+# Create persistent volume for model checkpoints
+volume = modal.Volume.from_name("chess-models", create_if_missing=True)
 
 image = (
     modal.Image.debian_slim()
@@ -243,10 +311,57 @@ image = (
     )
 )
 
-@app.function(image=image, timeout=60 * 60)
+@app.function(
+    image=image, 
+    timeout=60 * 60,
+    volumes={"/models": volume},  # Mount volume at /models
+    gpu="T4"  # Request GPU for faster training
+)
 def run_training():
-    # just call your main()
-    main()
+    """Train the chess model and persist to Modal Volume"""
+    model = main(volume_path="/models")
+    
+    # Commit volume changes so they persist
+    volume.commit()
+    print("✓ Volume committed - all checkpoints persisted!")
+    
+    return "Training complete and model saved to volume 'chess-models'"
+
+
+@app.function(
+    image=image,
+    volumes={"/models": volume}
+)
+def list_checkpoints():
+    """List all saved model checkpoints"""
+    import os
+    files = os.listdir("/models")
+    print("Available checkpoints:")
+    for f in files:
+        if f.endswith('.pt'):
+            filepath = f"/models/{f}"
+            size_mb = os.path.getsize(filepath) / (1024 * 1024)
+            print(f"  - {f} ({size_mb:.2f} MB)")
+    return files
+
+
+@app.function(
+    image=image,
+    volumes={"/models": volume}
+)
+def download_model(checkpoint_name: str = "best_model.pt"):
+    """Download a specific checkpoint from the volume"""
+    import os
+    filepath = f"/models/{checkpoint_name}"
+    
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"Checkpoint {checkpoint_name} not found in volume")
+    
+    with open(filepath, "rb") as f:
+        model_bytes = f.read()
+    
+    print(f"✓ Read {len(model_bytes) / (1024*1024):.2f} MB from {checkpoint_name}")
+    return model_bytes
 ##############################################
 
 if __name__ == "__main__":
