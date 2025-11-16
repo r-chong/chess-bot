@@ -19,8 +19,8 @@ def board_to_tensor(board: chess.Board):
 
     for square, piece in board.piece_map().items():
         # file is x and rank is y
-        # we subtract from 7 because coordinate system defaults to (0,0) being top left
-        # however we want (0,0) to be the bottom left.
+        # we subtract from 7 because chess board defaults to (0,0) being bottom left
+        # however we want (0,0) to be the top left.
         row = 7 - chess.square_rank(square)
         col = chess.square_file(square)
 
