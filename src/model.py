@@ -7,8 +7,10 @@ from torch.utils.data import DataLoader
 
 from datasets import load_dataset
 
+# CONSTANTS
 C_PLANES = 12
 NUM_MOVES = 64 * 64
+NUM_EPOCHS = 5
 
 # HuggingFace calls a row an "example"
 def preprocess(example):
@@ -18,7 +20,7 @@ def preprocess(example):
 
 # turns individual tensors into a tensor batch
 def collate_fn(batch):
-    inputs = torch.stack(b["input"] for b in batch)
+    inputs = torch.stack([b["input"] for b in batch]) # (Batch size, C, 8, 8)
 
     policy = torch.tensor(
         [b["policy"] for b in batch],
@@ -31,6 +33,38 @@ def collate_fn(batch):
     ).unsqueeze(1)
 
     return inputs, policy, value
+
+def make_value_label(example):
+    # white centipawns
+    cp = example["cp"]
+    mate = example["mate"]
+
+    if mate is not None:
+        # not None - so if it's mate
+        value = 1.0 if mate > 0 else -1.0
+    else:
+        # squash via tanh
+        value = np.tanh(cp / 400.0)
+
+    example["value"] = np.float32(value)
+    return example
+
+def make_policy_label(example):
+    # line is the best move sequence Stockfish found from that position, written in UCI move format.
+    line = example["line"]
+    if not line:
+        example["policy"] = -1
+        return example
+
+    first_move_str = line.split()[0]
+    move = chess.Move.from_uci(first_move_str)
+
+    from_sq = move.from_square
+    to_sq = move.to_square
+    idx = from_sq * 64 + to_sq
+
+    example["policy"] = idx
+    return example
 
 def board_to_tensor(board: chess.Board):   
     tensor = np.zeros((C_PLANES, 8, 8), dtype=np.float32)
@@ -105,6 +139,8 @@ class SimpleChessNet(nn.Module):
 
 
 def main():
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     # collect data
     dset = load_dataset("Lichess/chess-evaluations", split="train[:200000]")
 
@@ -129,11 +165,64 @@ def main():
         shuffle=True
     )
 
-    model = SimpleChessNet()
+    model = SimpleChessNet().to(DEVICE)
 
-    # TRAINING LOGIC
+    policy_criterion = nn.CrossEntropyLoss()
+    value_criterion = nn.MSELoss()
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    # total_loss = cross_entropy(policy, labels_policy) + MSE(value, labels_value)
+    # -------------
+    # TRAINING LOOP
+    # -------------
+
+    # SEE TOP FOR EPOCH CONSTANT
+
+    for epoch in range(NUM_EPOCHS):
+        model.train()
+        running_loss = 0.0
+        running_policy_loss = 0.0
+        running_value_loss = 0.0
+        n_examples = 0
+
+        for inputs, policy_target, value_target in loader:
+            inputs = inputs.to(DEVICE)
+            policy_target = policy_target.to(DEVICE)
+            value_target = value_target.to(DEVICE)
+
+            optimizer.zero_grad()
+
+            policy_logits, value_pred = model(inputs)
+
+            # Loss
+            # the target is the optimal solution and the logits/pred are what we have
+            loss_policy = policy_criterion(policy_logits, policy_target)
+            loss_value = value_criterion(value_pred, value_target)
+
+            # policy is the probability distribution of potential moves, value is how good our current position is (distilled by stockfish)
+            loss = loss_policy + loss_value
+
+            # backpropagation
+            loss.backward()
+
+            # gradient descent??
+            optimizer.step()
+
+            batch_size = inputs.size(0)
+            running_loss += loss.item() * batch_size
+            running_policy_loss += loss_policy.item() * batch_size
+            running_value_loss += loss_value.item() * batch_size
+            n_examples += batch_size
+
+        epoch_loss = running_loss / n_examples
+        epoch_policy = running_policy_loss / n_examples
+        epoch_value = running_value_loss / n_examples
+
+        print(
+                f"Epoch {epoch+1}/{NUM_EPOCHS} "
+                f"- loss: {epoch_loss:.4f} "
+                f"(policy: {epoch_policy:.4f}, value: {epoch_value:.4f})"
+            )
 
 if __name__ == "__main__":
     main()
