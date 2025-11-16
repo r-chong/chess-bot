@@ -7,6 +7,8 @@ from torch.utils.data import DataLoader
 
 from datasets import load_dataset
 
+import modal
+
 # CONSTANTS
 C_PLANES = 12
 NUM_MOVES = 64 * 64
@@ -144,7 +146,7 @@ def main():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # collect data
-    dset = load_dataset("Lichess/chess-evaluations", split="train[:200000]")
+    dset = load_dataset("Lichess/chess-position-evaluations", split="train[:200000]")
 
     # filter out low-depth / unusable samples
     filtered = dset.filter(lambda row: row["depth"] >= 16 and row["cp"] is not None)
@@ -227,6 +229,25 @@ def main():
                 f"- loss: {epoch_loss:.4f} "
                 f"(policy: {epoch_policy:.4f}, value: {epoch_value:.4f})"
             )
+
+##############################################
+app = modal.App("chess-eval-training")
+
+image = (
+    modal.Image.debian_slim()
+    .pip_install(
+        "torch",
+        "numpy",
+        "python-chess",
+        "datasets",
+    )
+)
+
+@app.function(image=image, timeout=60 * 60)
+def run_training():
+    # just call your main()
+    main()
+##############################################
 
 if __name__ == "__main__":
     main()
